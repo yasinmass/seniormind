@@ -20,13 +20,28 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
 
   useEffect(() => () => timers.current.forEach(clearTimeout), []);
 
+  // Called by VoiceButton on first tap (idle → listening).
   const startConversation = () => {
     if (inConversation) return;
     onEnterConversation();
     setState("listening");
-    timers.current.push(setTimeout(() => setState("thinking"), 2200));
-    timers.current.push(setTimeout(() => setState("speaking"), 3600));
-    timers.current.push(setTimeout(() => setState("idle"),     6400));
+    // Timers are intentionally NOT started here anymore.
+    // They start in handleRecordingComplete once the user stops recording.
+  };
+
+  // Called by VoiceButton when the user taps again and recording finishes.
+  const handleRecordingComplete = (audioBlob) => {
+    // audioBlob is available for the next pipeline step (e.g. Whisper transcription).
+    // For now we just log it and run the placeholder animation.
+    console.log("[Home] Recording complete – blob ready for next pipeline step:", audioBlob);
+    timers.current.forEach(clearTimeout);
+    timers.current = [];
+    setState("thinking");
+    timers.current.push(setTimeout(() => setState("speaking"), 1400));
+    timers.current.push(setTimeout(() => {
+      setState("idle");
+      onExitConversation();
+    }, 4200));
   };
 
   const handleBack = () => {
@@ -53,7 +68,12 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
       )}
 
       <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "0 24px" }}>
-        <VoiceButton state={state} onClick={startConversation} disabled={inConversation} />
+        <VoiceButton
+          state={state}
+          onClick={startConversation}
+          onRecordingComplete={handleRecordingComplete}
+          disabled={state === "thinking" || state === "speaking"}
+        />
         <p style={{ fontSize: 22, fontWeight: 700, color: theme.primaryDark, marginTop: 20 }}>
           {STATE_LABELS[state]}
         </p>
