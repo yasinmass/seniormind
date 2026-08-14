@@ -30,19 +30,44 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
   };
 
   // Called by VoiceButton when the user taps again and recording finishes.
-  const handleRecordingComplete = (audioBlob) => {
-    // audioBlob is available for the next pipeline step (e.g. Whisper transcription).
-    // For now we just log it and run the placeholder animation.
+  const handleRecordingComplete = async (audioBlob) => {
     console.log("[Home] Recording complete – blob ready for next pipeline step:", audioBlob);
     timers.current.forEach(clearTimeout);
     timers.current = [];
     setState("thinking");
-    timers.current.push(setTimeout(() => setState("speaking"), 1400));
-    timers.current.push(setTimeout(() => {
-      setState("idle");
-      onExitConversation();
-    }, 4200));
+
+    console.log("[AudioUpload] Sending audio");
+    try {
+      const formData = new FormData();
+      formData.append("audio", audioBlob, "recording.webm");
+
+      const response = await fetch("http://127.0.0.1:8000/api/audio/", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+
+      const data = await response.json();
+      console.log("[AudioUpload] Upload successful");
+      console.log("[AudioUpload] Server response:", data);
+
+      timers.current.push(setTimeout(() => setState("speaking"), 1400));
+      timers.current.push(setTimeout(() => {
+        setState("idle");
+        onExitConversation();
+      }, 4200));
+    } catch (err) {
+      console.log("[AudioUpload] Upload failed", err);
+      timers.current.push(setTimeout(() => {
+        setState("idle");
+        onExitConversation();
+      }, 1500));
+    }
   };
+
 
   const handleBack = () => {
     timers.current.forEach(clearTimeout);
