@@ -1,5 +1,17 @@
+# Dependencies
+node_modules/
+
+# Build
+dist/
+dist-ssr/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
 # Logs
-logs
+logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
@@ -7,18 +19,48 @@ yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
 
-node_modules
-dist
-dist-ssr
+# Local files
 *.local
 
-# Editor directories and files
+# Editor
 .vscode/*
 !.vscode/extensions.json
-.idea
+.idea/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE / Visual Studio
 *.suo
 *.ntvs*
 *.njsproj
+*.njsproj.user
 *.sln
 *.sw?
+
+# Python / Backend (only if backend is added to this repo later)
+__pycache__/
+*.pyc
+venv/
+freshvenv/
+newvenv/
+
+# Local databases
+*.sqlite3
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env
+
+# Django
+*.sqlite3
+media/
+staticfiles/
