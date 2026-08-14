@@ -53,6 +53,12 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
       const data = await response.json();
       console.log("[AudioUpload] Upload successful");
       console.log("[AudioUpload] Server response:", data);
+      if (data.text !== undefined) {
+        console.log("[STT] Transcript:", data.text);
+      }
+      if (data.response !== undefined) {
+        console.log("[Bhavi] Response:", data.response);
+      }
 
       timers.current.push(setTimeout(() => setState("speaking"), 1400));
       timers.current.push(setTimeout(() => {
