@@ -1,3 +1,4 @@
+import base64
 import os
 import sys
 import tempfile
@@ -7,6 +8,7 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_POST
 from .services.stt import transcribe_audio
 from .services.llm import generate_bhavi_response
+from .services.tts import generate_speech
 
 
 def health_check(request):
@@ -73,7 +75,6 @@ def upload_audio(request):
         try:
             bhavi_response = generate_bhavi_response(transcript_text)
         except ConnectionError as conn_err:
-            # Ollama not running, or unreachable
             print(f"[AudioAPI] LLM connection error: {conn_err}", flush=True)
             return JsonResponse({
                 "status": "error",
@@ -86,7 +87,6 @@ def upload_audio(request):
                 "error": "Bhavi took too long to respond. Please try again."
             }, status=503)
         except RuntimeError as cfg_err:
-            # Config error (e.g. unknown provider)
             print(f"[AudioAPI] LLM config error: {cfg_err}", flush=True)
             return JsonResponse({
                 "status": "error",
@@ -101,14 +101,44 @@ def upload_audio(request):
                 "error": "Bhavi response service unavailable"
             }, status=503)
 
-        # ── Step 6: Return full response ──────────────────────────────────────
+        # ── Step 6: TTS → Bhavi audio ─────────────────────────────────────────
+        audio_b64 = None
+        audio_format = None
+
+        try:
+            wav_bytes = generate_speech(bhavi_response, detected_language)
+            if wav_bytes:
+                audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
+                audio_format = "wav"
+                print(
+                    f"[AudioAPI] TTS audio encoded "
+                    f"({len(wav_bytes) // 1024} KB → {len(audio_b64)} chars base64)",
+                    flush=True,
+                )
+            else:
+                print("[AudioAPI] TTS returned empty audio — text response only", flush=True)
+        except Exception as tts_err:
+            # TTS failure is non-fatal: return text response, log the error.
+            print(f"[AudioAPI] TTS failed (non-fatal): {tts_err}", flush=True)
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+
+        # ── Step 7: Return full response ──────────────────────────────────────
         print("[AudioAPI] Returning response", flush=True)
-        return JsonResponse({
+
+        response_payload = {
             "status": "ok",
-            "text": transcript_text,
-            "language": detected_language,
-            "response": bhavi_response
-        })
+            "text": transcript_text,         # STT transcript
+            "language": detected_language,   # detected language
+            "response": bhavi_response,      # Bhavi text response
+        }
+
+        # Audio is optional — only included when TTS succeeded.
+        if audio_b64:
+            response_payload["audio_b64"]    = audio_b64
+            response_payload["audio_format"] = audio_format
+
+        return JsonResponse(response_payload)
 
     except Exception as e:
         print(f"[AudioAPI] Unexpected error: {e}", flush=True)
