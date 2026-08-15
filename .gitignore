@@ -39,7 +39,7 @@ Thumbs.db
 *.sln
 *.sw?
 
-# Python / Backend (only if backend is added to this repo later)
+# Python / Backend
 __pycache__/
 *.pyc
 venv/
@@ -66,5 +66,5 @@ media/
 staticfiles/
 
 # TTS — generated audio test files and large model binaries
-backend/test_tts.wav
-backend/models/tts/**/*.onnx
+backend/models/
+backend/test_tts*.wav
