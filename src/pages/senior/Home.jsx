@@ -16,11 +16,24 @@ const STATE_LABELS = {
 export default function Home({ name, inConversation, onEnterConversation, onExitConversation }) {
   const { theme } = useTheme();
   const [state, setState] = useState("idle");
-  const timers  = useRef([]);
+  const timers = useRef([]);
+
+  // Session memory ref — persists across turns during an active conversation session,
+  // reset to null when exiting conversation mode.
+  const conversationIdRef = useRef(null);
 
   // Audio playback refs — never cause re-renders.
   const audioRef    = useRef(null);   // current HTMLAudioElement
   const audioBlobRef = useRef(null);  // current object URL (for revoke on cleanup)
+
+  // Helper to generate a unique session ID client-side
+  const getOrCreateSessionId = () => {
+    if (!conversationIdRef.current) {
+      conversationIdRef.current = `session-${Math.random().toString(36).substring(2, 10)}-${Date.now()}`;
+      console.log("[Memory] Created new frontend conversation ID:", conversationIdRef.current);
+    }
+    return conversationIdRef.current;
+  };
 
   // Cleanup: cancel timers + stop any playing audio on unmount.
   useEffect(() => {
@@ -42,8 +55,6 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
       } catch (_) {}
       audioRef.current = null;
     }
-    // Revoke any object URL we created (base64 data URLs don't need revoking,
-    // but blob URLs would — keep this for future-proofing).
     if (audioBlobRef.current) {
       try { URL.revokeObjectURL(audioBlobRef.current); } catch (_) {}
       audioBlobRef.current = null;
@@ -55,7 +66,6 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
    * Transitions: thinking → speaking (on play start), speaking → idle (on end).
    */
   const _playAudio = (audio_b64, audio_format) => {
-    // Stop any previously playing audio before starting new one.
     _stopAudio();
 
     const dataUrl = `data:audio/${audio_format};base64,${audio_b64}`;
@@ -66,16 +76,14 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
       console.log("[TTS] Audio playback finished");
       _stopAudio();
       setState("idle");
-      onExitConversation();
+      // Keep in conversation mode for subsequent voice turns within the same session
     };
 
     audio.onerror = (err) => {
       console.error("[TTS] Audio playback error:", err);
       _stopAudio();
-      // Fall back: wait a moment then go idle.
       timers.current.push(setTimeout(() => {
         setState("idle");
-        onExitConversation();
       }, 800));
     };
 
@@ -85,20 +93,14 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
         setState("speaking");
       })
       .catch((err) => {
-        // Browsers may block autoplay if there was no prior user gesture in
-        // this browsing context. The mic tap IS a user gesture, so this should
-        // normally succeed — log it clearly if it doesn't.
         console.warn(
-          "[TTS] Autoplay blocked or playback failed — " +
-          "falling back to timer-based state transition.",
+          "[TTS] Autoplay blocked or playback failed — falling back to timer.",
           err
         );
         _stopAudio();
-        // Still show speaking state briefly so the UI doesn't feel broken.
         setState("speaking");
         timers.current.push(setTimeout(() => {
           setState("idle");
-          onExitConversation();
         }, 3500));
       });
   };
@@ -106,6 +108,7 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
   // ── Called by VoiceButton on first tap (idle → listening) ─────────────────
   const startConversation = () => {
     if (inConversation) return;
+    getOrCreateSessionId();
     onEnterConversation();
     setState("listening");
   };
@@ -117,10 +120,13 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
     timers.current = [];
     setState("thinking");
 
-    console.log("[AudioUpload] Sending audio");
+    const sessionId = getOrCreateSessionId();
+
+    console.log(`[AudioUpload] Sending audio (conversation_id: ${sessionId})`);
     try {
       const formData = new FormData();
       formData.append("audio", audioBlob, "recording.webm");
+      formData.append("conversation_id", sessionId);
 
       const response = await fetch("http://127.0.0.1:8000/api/audio/", {
         method: "POST",
@@ -135,6 +141,9 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
       console.log("[AudioUpload] Upload successful");
       console.log("[AudioUpload] Server response:", data);
 
+      if (data.conversation_id) {
+        conversationIdRef.current = data.conversation_id;
+      }
       if (data.text !== undefined) {
         console.log("[STT] Transcript:", data.text);
       }
@@ -142,21 +151,17 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
         console.log("[Bhavi] Response:", data.response);
       }
 
-      // ── Play Bhavi's audio if the server returned it ──────────────────────
+      // ── Play Bhavi's audio if returned ────────────────────────────────────
       if (data.audio_b64 && data.audio_format) {
         console.log(
           `[TTS] Received audio (${Math.round(data.audio_b64.length * 0.75 / 1024)} KB WAV)`
         );
         _playAudio(data.audio_b64, data.audio_format);
-        // State transitions are driven by audio events — no timers needed here.
       } else {
-        // No audio in response (TTS failed non-fatally on the server).
-        // Fall back to a timer-based state cycle so the UI doesn't get stuck.
         console.warn("[TTS] No audio in response — using fallback timer");
         timers.current.push(setTimeout(() => setState("speaking"), 1400));
         timers.current.push(setTimeout(() => {
           setState("idle");
-          onExitConversation();
         }, 4200));
       }
 
@@ -164,12 +169,13 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
       console.error("[AudioUpload] Upload failed:", err);
       timers.current.push(setTimeout(() => {
         setState("idle");
-        onExitConversation();
       }, 1500));
     }
   };
 
   const handleBack = () => {
+    console.log("[Home] Resetting conversation memory session ID on exit");
+    conversationIdRef.current = null;
     timers.current.forEach(clearTimeout);
     timers.current = [];
     _stopAudio();

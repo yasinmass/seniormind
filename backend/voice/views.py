@@ -1,14 +1,21 @@
 import base64
+import json
 import os
 import sys
 import tempfile
 import traceback
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_http_methods, require_POST
 from .services.stt import transcribe_audio
 from .services.llm import generate_bhavi_response
 from .services.tts import generate_speech
+from .services.memory import (
+    get_conversation_history,
+    add_conversation_turn,
+    generate_session_id,
+)
+from .services import memory_store
 
 
 def health_check(request):
@@ -31,6 +38,15 @@ def upload_audio(request):
             "status": "error",
             "error": "Audio file is required"
         }, status=400)
+
+    # Extract or generate conversation_id
+    conversation_id = request.POST.get('conversation_id') or request.POST.get('session_id')
+    if not conversation_id or not conversation_id.strip():
+        conversation_id = generate_session_id()
+        print(f"[AudioAPI] No conversation_id provided — generated new session: {conversation_id}", flush=True)
+    else:
+        conversation_id = conversation_id.strip()
+        print(f"[AudioAPI] Conversation ID: {conversation_id}", flush=True)
 
     print("[AudioAPI] File received", flush=True)
     print(f"[AudioAPI] Filename: {audio_file.name}", flush=True)
@@ -71,9 +87,23 @@ def upload_audio(request):
 
         print(f"[AudioAPI] Transcript: {transcript_text}", flush=True)
 
-        # ── Step 5: LLM → Bhavi response ─────────────────────────────────────
+        # ── Step 5: Retrieve History & Call LLM ──────────────────────────────
+        conversation_history = []
         try:
-            bhavi_response = generate_bhavi_response(transcript_text)
+            conversation_history = get_conversation_history(conversation_id)
+            print(
+                f"[AudioAPI] Retrieved {len(conversation_history)} historical message(s) "
+                f"for session {conversation_id}",
+                flush=True,
+            )
+        except Exception as mem_err:
+            print(f"[AudioAPI] Warning: Failed to retrieve memory for {conversation_id}: {mem_err}", flush=True)
+
+        try:
+            bhavi_response = generate_bhavi_response(
+                transcript_text,
+                conversation_history=conversation_history
+            )
         except ConnectionError as conn_err:
             print(f"[AudioAPI] LLM connection error: {conn_err}", flush=True)
             return JsonResponse({
@@ -101,6 +131,12 @@ def upload_audio(request):
                 "error": "Bhavi response service unavailable"
             }, status=503)
 
+        # ── Step 5b: Save turn to memory ──────────────────────────────────────
+        try:
+            add_conversation_turn(conversation_id, transcript_text, bhavi_response)
+        except Exception as turn_err:
+            print(f"[AudioAPI] Warning: Failed to save turn to memory: {turn_err}", flush=True)
+
         # ── Step 6: TTS → Bhavi audio ─────────────────────────────────────────
         audio_b64 = None
         audio_format = None
@@ -118,7 +154,6 @@ def upload_audio(request):
             else:
                 print("[AudioAPI] TTS returned empty audio — text response only", flush=True)
         except Exception as tts_err:
-            # TTS failure is non-fatal: return text response, log the error.
             print(f"[AudioAPI] TTS failed (non-fatal): {tts_err}", flush=True)
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
@@ -128,12 +163,12 @@ def upload_audio(request):
 
         response_payload = {
             "status": "ok",
-            "text": transcript_text,         # STT transcript
-            "language": detected_language,   # detected language
-            "response": bhavi_response,      # Bhavi text response
+            "text": transcript_text,           # STT transcript
+            "language": detected_language,     # detected language
+            "response": bhavi_response,        # Bhavi text response
+            "conversation_id": conversation_id,# Session ID for conversation tracking
         }
 
-        # Audio is optional — only included when TTS succeeded.
         if audio_b64:
             response_payload["audio_b64"]    = audio_b64
             response_payload["audio_format"] = audio_format
@@ -156,3 +191,155 @@ def upload_audio(request):
                 print("[AudioAPI] Temporary file deleted", flush=True)
             except OSError as err:
                 print(f"[AudioAPI] Warning: Failed to delete temp file: {err}", flush=True)
+
+
+# ── REST Endpoints for Stage 8.1 Persistent User Memory ─────────────────────────
+
+@csrf_exempt
+@require_http_methods(["GET", "POST", "DELETE"])
+def manage_memories(request):
+    """
+    REST Endpoint for User Memory collection management:
+    - GET /api/memories/          -> List current user's memories
+    - POST /api/memories/         -> Create or update a memory record
+    - DELETE /api/memories/       -> Clear all memories for current user
+    """
+    user_identifier = request.GET.get("user_identifier") or request.headers.get("X-User-Identifier") or "default_user"
+    user_obj = request.user if (hasattr(request, "user") and getattr(request.user, "is_authenticated", False)) else None
+
+    if request.method == "GET":
+        memory_type = request.GET.get("memory_type")
+        memories = memory_store.list_memories(
+            user_identifier=user_identifier,
+            memory_type=memory_type,
+            user=user_obj
+        )
+        memories_data = [
+            {
+                "id": m.id,
+                "user_identifier": m.user_identifier,
+                "memory_type": m.memory_type,
+                "key": m.key,
+                "value": m.value,
+                "created_at": m.created_at.isoformat(),
+                "updated_at": m.updated_at.isoformat(),
+            }
+            for m in memories
+        ]
+        return JsonResponse({"status": "ok", "memories": memories_data})
+
+    elif request.method == "POST":
+        try:
+            body = json.loads(request.body.decode("utf-8")) if request.body else {}
+        except json.JSONDecodeError:
+            return JsonResponse({"status": "error", "error": "Invalid JSON body"}, status=400)
+
+        key = body.get("key")
+        value = body.get("value")
+        memory_type = body.get("memory_type", "general")
+        body_uid = body.get("user_identifier")
+        active_uid = body_uid if (body_uid and str(body_uid).strip()) else user_identifier
+
+        try:
+            memory_obj = memory_store.create_memory(
+                key=key,
+                value=value,
+                memory_type=memory_type,
+                user_identifier=active_uid,
+                user=user_obj,
+            )
+            return JsonResponse({
+                "status": "ok",
+                "memory": {
+                    "id": memory_obj.id,
+                    "user_identifier": memory_obj.user_identifier,
+                    "memory_type": memory_obj.memory_type,
+                    "key": memory_obj.key,
+                    "value": memory_obj.value,
+                    "created_at": memory_obj.created_at.isoformat(),
+                    "updated_at": memory_obj.updated_at.isoformat(),
+                }
+            }, status=201)
+        except ValueError as val_err:
+            return JsonResponse({"status": "error", "error": str(val_err)}, status=400)
+        except Exception as err:
+            return JsonResponse({"status": "error", "error": str(err)}, status=500)
+
+    elif request.method == "DELETE":
+        deleted_count = memory_store.clear_memories(user_identifier=user_identifier, user=user_obj)
+        return JsonResponse({
+            "status": "ok",
+            "message": f"Cleared {deleted_count} memories for user [{user_identifier}]",
+            "deleted_count": deleted_count
+        })
+
+
+@csrf_exempt
+@require_http_methods(["DELETE", "GET", "PUT"])
+def manage_single_memory(request, memory_id):
+    """
+    REST Endpoint for single memory item:
+    - DELETE /api/memories/<id>/ -> Delete single memory owned by user
+    - GET /api/memories/<id>/    -> Retrieve single memory
+    - PUT /api/memories/<id>/    -> Update value of single memory
+    """
+    user_identifier = request.GET.get("user_identifier") or request.headers.get("X-User-Identifier") or "default_user"
+    user_obj = request.user if (hasattr(request, "user") and getattr(request.user, "is_authenticated", False)) else None
+
+    if request.method == "DELETE":
+        success = memory_store.delete_memory(memory_id, user_identifier=user_identifier, user=user_obj)
+        if success:
+            return JsonResponse({"status": "ok", "message": f"Memory #{memory_id} deleted"})
+        return JsonResponse({"status": "error", "error": "Memory not found or access denied"}, status=404)
+
+    elif request.method == "GET":
+        memory_obj = memory_store.get_memory(memory_id, user_identifier=user_identifier, user=user_obj)
+        if not memory_obj:
+            return JsonResponse({"status": "error", "error": "Memory not found or access denied"}, status=404)
+        return JsonResponse({
+            "status": "ok",
+            "memory": {
+                "id": memory_obj.id,
+                "user_identifier": memory_obj.user_identifier,
+                "memory_type": memory_obj.memory_type,
+                "key": memory_obj.key,
+                "value": memory_obj.value,
+                "created_at": memory_obj.created_at.isoformat(),
+                "updated_at": memory_obj.updated_at.isoformat(),
+            }
+        })
+
+    elif request.method == "PUT":
+        try:
+            body = json.loads(request.body.decode("utf-8")) if request.body else {}
+        except json.JSONDecodeError:
+            return JsonResponse({"status": "error", "error": "Invalid JSON body"}, status=400)
+
+        value = body.get("value")
+        memory_type = body.get("memory_type")
+
+        try:
+            memory_obj = memory_store.update_memory(
+                memory_id=memory_id,
+                value=value,
+                memory_type=memory_type,
+                user_identifier=user_identifier,
+                user=user_obj,
+            )
+            if not memory_obj:
+                return JsonResponse({"status": "error", "error": "Memory not found or access denied"}, status=404)
+
+            return JsonResponse({
+                "status": "ok",
+                "memory": {
+                    "id": memory_obj.id,
+                    "user_identifier": memory_obj.user_identifier,
+                    "memory_type": memory_obj.memory_type,
+                    "key": memory_obj.key,
+                    "value": memory_obj.value,
+                    "created_at": memory_obj.created_at.isoformat(),
+                    "updated_at": memory_obj.updated_at.isoformat(),
+                }
+            })
+        except ValueError as val_err:
+            return JsonResponse({"status": "error", "error": str(val_err)}, status=400)

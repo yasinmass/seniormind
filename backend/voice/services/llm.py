@@ -5,7 +5,7 @@ LLM service for SeniorMind — Bhavi's AI response layer.
 
 Current provider: Ollama (local, free, no API key required).
 To switch providers in the future, only this file needs to change.
-The public interface `generate_bhavi_response(transcript)` stays the same.
+The public interface `generate_bhavi_response(transcript, conversation_history)` stays the same.
 """
 
 import json
@@ -14,7 +14,7 @@ import sys
 import traceback
 import urllib.error
 import urllib.request
-from typing import Optional
+from typing import Dict, List, Optional
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 # All values can be overridden via environment variables.
@@ -46,19 +46,25 @@ BHAVI_SYSTEM_PROMPT = (
 
 # ── Ollama provider ───────────────────────────────────────────────────────────
 
-def _call_ollama(transcript: str) -> str:
+def _call_ollama(transcript: str, conversation_history: Optional[List[Dict[str, str]]] = None) -> str:
     """
-    Call the local Ollama /api/chat endpoint with the Bhavi system prompt.
+    Call the local Ollama /api/chat endpoint with the Bhavi system prompt and conversation history.
     Uses only Python's stdlib urllib — no extra packages needed.
     """
     endpoint = f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat"
 
+    # Build structured messages payload: System prompt + History + Current User Message
+    messages = [{"role": "system", "content": BHAVI_SYSTEM_PROMPT}]
+
+    if conversation_history:
+        # Include previous user and assistant turns
+        messages.extend(conversation_history)
+
+    messages.append({"role": "user", "content": transcript})
+
     payload = {
         "model": LLM_MODEL,
-        "messages": [
-            {"role": "system",    "content": BHAVI_SYSTEM_PROMPT},
-            {"role": "user",      "content": transcript},
-        ],
+        "messages": messages,
         "stream": False,         # receive full response at once
         "options": {
             "temperature": 0.7,
@@ -74,14 +80,18 @@ def _call_ollama(transcript: str) -> str:
         method="POST",
     )
 
-    print(f"[LLM] Sending transcript to Ollama ({OLLAMA_BASE_URL}, model={LLM_MODEL})", flush=True)
+    history_len = len(conversation_history) if conversation_history else 0
+    print(
+        f"[LLM] Sending prompt + {history_len} history turn(s) to Ollama "
+        f"({OLLAMA_BASE_URL}, model={LLM_MODEL})",
+        flush=True
+    )
 
     try:
         with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as response:
             raw = response.read().decode("utf-8")
 
     except urllib.error.URLError as url_err:
-        # Covers: connection refused (Ollama not running), DNS errors, etc.
         cause = str(url_err.reason) if hasattr(url_err, "reason") else str(url_err)
         raise ConnectionError(
             f"Cannot reach Ollama at {OLLAMA_BASE_URL}. "
@@ -119,10 +129,13 @@ def _call_ollama(transcript: str) -> str:
 
 # ── Public interface ──────────────────────────────────────────────────────────
 
-def generate_bhavi_response(transcript: str) -> str:
+def generate_bhavi_response(
+    transcript: str,
+    conversation_history: Optional[List[Dict[str, str]]] = None
+) -> str:
     """
-    Send the STT transcript to the configured LLM provider and return
-    Bhavi's response as a plain string.
+    Send the STT transcript and optional conversation history to the configured LLM provider
+    and return Bhavi's response as a plain string.
 
     Raises:
         ConnectionError  — if Ollama (or cloud provider) is unreachable.
@@ -136,11 +149,10 @@ def generate_bhavi_response(transcript: str) -> str:
 
     if provider == "ollama":
         try:
-            response_text = _call_ollama(transcript)
+            response_text = _call_ollama(transcript, conversation_history)
             print("[LLM] Response received from Ollama", flush=True)
             return response_text
         except (ConnectionError, TimeoutError, RuntimeError, ValueError):
-            # Re-raise directly — already descriptive
             raise
         except Exception as exc:
             print(f"[LLM] Unexpected error from Ollama: {type(exc).__name__}: {exc}", flush=True)
