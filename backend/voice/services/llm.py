@@ -5,7 +5,7 @@ LLM service for SeniorMind — Bhavi's AI response layer.
 
 Current provider: Ollama (local, free, no API key required).
 To switch providers in the future, only this file needs to change.
-The public interface `generate_bhavi_response(transcript, conversation_history)` stays the same.
+The public interface `generate_bhavi_response(transcript, conversation_history, user_memory_context)` stays consistent.
 """
 
 import json
@@ -40,24 +40,37 @@ BHAVI_SYSTEM_PROMPT = (
     "- Do NOT pretend to be a doctor or give medical diagnoses.\n"
     "- Do NOT invent personal details about the person you are talking to.\n"
     "- If you are unsure about something, gently say so.\n"
-    "- Always be encouraging, patient, and positive."
+    "- Always be encouraging, patient, and positive.\n"
+    "- Use remembered user information when relevant.\n"
+    "- Do not claim to know information that is not present in the conversation or memory.\n"
+    "- If remembered information conflicts with the current user statement, prefer the current user statement.\n"
+    "- Do not mention internal memory systems, database records, or implementation details to the user."
 )
 
 
 # ── Ollama provider ───────────────────────────────────────────────────────────
 
-def _call_ollama(transcript: str, conversation_history: Optional[List[Dict[str, str]]] = None) -> str:
+def _call_ollama(
+    transcript: str,
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    user_memory_context: Optional[str] = None,
+) -> str:
     """
-    Call the local Ollama /api/chat endpoint with the Bhavi system prompt and conversation history.
+    Call the local Ollama /api/chat endpoint with the Bhavi system prompt,
+    persistent user memory context, and short-term conversation history.
     Uses only Python's stdlib urllib — no extra packages needed.
     """
     endpoint = f"{OLLAMA_BASE_URL.rstrip('/')}/api/chat"
 
+    # System prompt + Persistent User Memory Context
+    system_content = BHAVI_SYSTEM_PROMPT
+    if user_memory_context and str(user_memory_context).strip():
+        system_content += f"\n\n{str(user_memory_context).strip()}"
+
     # Build structured messages payload: System prompt + History + Current User Message
-    messages = [{"role": "system", "content": BHAVI_SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": system_content}]
 
     if conversation_history:
-        # Include previous user and assistant turns
         messages.extend(conversation_history)
 
     messages.append({"role": "user", "content": transcript})
@@ -81,8 +94,9 @@ def _call_ollama(transcript: str, conversation_history: Optional[List[Dict[str, 
     )
 
     history_len = len(conversation_history) if conversation_history else 0
+    has_mem = "with memory context" if user_memory_context else "without memory context"
     print(
-        f"[LLM] Sending prompt + {history_len} history turn(s) to Ollama "
+        f"[LLM] Sending prompt ({has_mem}) + {history_len} history turn(s) to Ollama "
         f"({OLLAMA_BASE_URL}, model={LLM_MODEL})",
         flush=True
     )
@@ -131,10 +145,11 @@ def _call_ollama(transcript: str, conversation_history: Optional[List[Dict[str, 
 
 def generate_bhavi_response(
     transcript: str,
-    conversation_history: Optional[List[Dict[str, str]]] = None
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    user_memory_context: Optional[str] = None,
 ) -> str:
     """
-    Send the STT transcript and optional conversation history to the configured LLM provider
+    Send the STT transcript, conversation history, and user memory context to the configured LLM provider
     and return Bhavi's response as a plain string.
 
     Raises:
@@ -149,7 +164,11 @@ def generate_bhavi_response(
 
     if provider == "ollama":
         try:
-            response_text = _call_ollama(transcript, conversation_history)
+            response_text = _call_ollama(
+                transcript,
+                conversation_history=conversation_history,
+                user_memory_context=user_memory_context,
+            )
             print("[LLM] Response received from Ollama", flush=True)
             return response_text
         except (ConnectionError, TimeoutError, RuntimeError, ValueError):

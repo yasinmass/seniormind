@@ -171,3 +171,85 @@ def clear_memories(
     deleted_count, _ = UserMemory.objects.filter(user_identifier=uid).delete()
     print(f"[MemoryStore] Cleared {deleted_count} memories for user [{uid}]", flush=True)
     return deleted_count
+
+
+def get_relevant_memories(
+    user_identifier: Optional[str] = "default_user",
+    transcript: Optional[str] = None,
+    user=None,
+    max_memories: int = 5,
+) -> List[UserMemory]:
+    """
+    Retrieve relevant persistent memories owned by the specified user for LLM context inclusion.
+
+    Selection strategy:
+    1. Filter strictly by user_identifier (or user).
+    2. If transcript is provided, prioritize memories whose key, value, or memory_type
+       matches terms in the transcript.
+    3. Cap output to max_memories (default: 5) to keep LLM context bounded.
+
+    Args:
+        user_identifier: User identifier string
+        transcript: Optional user transcript for keyword relevance matching
+        user: Optional Django User instance
+        max_memories: Maximum number of memories to return (default: 5)
+
+    Returns:
+        List of UserMemory objects owned ONLY by this user.
+    """
+    uid = _resolve_user_identifier(user_identifier, user)
+    user_memories = list(UserMemory.objects.filter(user_identifier=uid))
+
+    if not user_memories:
+        return []
+
+    if not transcript or not str(transcript).strip():
+        # No transcript keyword matching needed, return most recently updated memories up to cap
+        return user_memories[:max_memories]
+
+    transcript_lower = str(transcript).strip().lower()
+    words = [w.strip("?,.!") for w in transcript_lower.split() if len(w) > 2]
+
+    relevant = []
+    other = []
+
+    for mem in user_memories:
+        key_lower = mem.key.lower()
+        val_lower = mem.value.lower()
+        type_lower = mem.memory_type.lower()
+
+        # Check for direct or word-level matches
+        is_relevant = (
+            key_lower in transcript_lower
+            or val_lower in transcript_lower
+            or type_lower in transcript_lower
+            or any(w in key_lower or w in val_lower for w in words)
+        )
+
+        if is_relevant:
+            relevant.append(mem)
+        else:
+            other.append(mem)
+
+    # Combine relevant first, then fill up to max_memories with remaining user memories
+    combined = relevant + other
+    return combined[:max_memories]
+
+
+def format_memories_for_prompt(memories: List[UserMemory]) -> str:
+    """
+    Format a list of UserMemory objects into a structured text prompt for the LLM.
+    Example:
+        Known information about the user:
+        - Family: daughter_name = Priya
+        - Preference: preferred_language = Tamil
+    """
+    if not memories:
+        return ""
+
+    lines = ["Known information about the user:"]
+    for m in memories:
+        category = m.memory_type.capitalize() if m.memory_type else "General"
+        lines.append(f"- {category}: {m.key} = {m.value}")
+
+    return "\n".join(lines)

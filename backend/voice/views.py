@@ -87,7 +87,10 @@ def upload_audio(request):
 
         print(f"[AudioAPI] Transcript: {transcript_text}", flush=True)
 
-        # ── Step 5: Retrieve History & Call LLM ──────────────────────────────
+        # ── Step 5: Retrieve History & Persistent Memories, Call LLM ─────────
+        user_identifier = request.POST.get("user_identifier") or request.headers.get("X-User-Identifier") or "default_user"
+        user_obj = request.user if (hasattr(request, "user") and getattr(request.user, "is_authenticated", False)) else None
+
         conversation_history = []
         try:
             conversation_history = get_conversation_history(conversation_id)
@@ -99,10 +102,28 @@ def upload_audio(request):
         except Exception as mem_err:
             print(f"[AudioAPI] Warning: Failed to retrieve memory for {conversation_id}: {mem_err}", flush=True)
 
+        user_memory_context = None
+        try:
+            persistent_memories = memory_store.get_relevant_memories(
+                user_identifier=user_identifier,
+                transcript=transcript_text,
+                user=user_obj,
+            )
+            if persistent_memories:
+                user_memory_context = memory_store.format_memories_for_prompt(persistent_memories)
+                print(
+                    f"[AudioAPI] Included {len(persistent_memories)} persistent memory item(s) "
+                    f"for user [{user_identifier}]",
+                    flush=True,
+                )
+        except Exception as pmem_err:
+            print(f"[AudioAPI] Warning: Failed to retrieve persistent memories: {pmem_err}", flush=True)
+
         try:
             bhavi_response = generate_bhavi_response(
                 transcript_text,
-                conversation_history=conversation_history
+                conversation_history=conversation_history,
+                user_memory_context=user_memory_context,
             )
         except ConnectionError as conn_err:
             print(f"[AudioAPI] LLM connection error: {conn_err}", flush=True)
