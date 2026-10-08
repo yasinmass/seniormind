@@ -78,90 +78,147 @@ Bhavi Speaks Aloud (Base64 WAV Audio)
 
 ## 🚀 How to Run the Code
 
-Follow these step-by-step instructions to run both the **Backend AI Voice Pipeline** and the **Frontend Web App** locally.
+> ⚠️ **You need to open 3 separate terminal windows.** Each service must run in its own terminal simultaneously.
 
-### 📋 Prerequisites
+---
+
+### 📋 Prerequisites (First Time Only)
 
 Make sure you have installed:
-1. **Node.js** (v18+)
-2. **Python** (v3.12+)
-3. **Ollama** (Local LLM runner — [Download Ollama](https://ollama.com/))
+1. **Node.js** (v18+) — [nodejs.org](https://nodejs.org/)
+2. **Python** (v3.12+) — [python.org](https://python.org/)
+3. **Ollama** — [ollama.com](https://ollama.com/)
+
+Then pull the AI model (run once):
+```bash
+ollama pull llama3.2:3b
+```
 
 ---
 
-### 1️⃣ Step 1: Start Ollama (LLM Service)
+### 🖥️ TERMINAL 1 — Ollama (AI Brain)
 
-Open a terminal and ensure Ollama has the `llama3.2:3b` model downloaded:
+Open a new terminal and run:
 
 ```bash
-# Download model (First time only)
-ollama pull llama3.2:3b
-
-# Start Ollama server
 ollama serve
 ```
-*Keep this terminal running.*
+
+✅ You should see: `Listening on 127.0.0.1:11434`
+
+> Keep this terminal open. Do not close it.
+>
+> If you see `bind: Only one usage of each socket address` — Ollama is **already running**, which is fine. You can skip this step.
 
 ---
 
-### 2️⃣ Step 2: Set Up & Run Django Backend
+### 🖥️ TERMINAL 2 — Django Backend (Voice Pipeline)
 
-Open a second terminal and navigate to the `backend/` directory:
+Open a **second** terminal, then run these commands one by one:
 
-```bash
-cd "senior AI/backend"
+**Step 1 — Go to the backend folder:**
+```powershell
+cd "senior AI\backend"
 ```
 
-Activate the Python virtual environment:
+**Step 2 — Activate the Python virtual environment:**
 
-**Windows (PowerShell):**
+Windows (PowerShell):
 ```powershell
 .\venv\Scripts\Activate.ps1
 ```
 
-**Linux / macOS:**
+macOS / Linux:
 ```bash
 source venv/bin/activate
 ```
 
-Apply database migrations:
+> You should see `(venv)` appear at the start of your terminal prompt.
+
+**Step 3 — Apply database setup (first time only):**
 ```bash
 python manage.py migrate
 ```
 
-Start the Django development server:
+**Step 4 — Start the server:**
 ```bash
-python manage.py runserver 8000
+python manage.py runserver
 ```
 
-The backend server will run at: `http://127.0.0.1:8000/api/`
+✅ You should see:
+```
+Django version 6.1 ...
+Starting development server at http://127.0.0.1:8000/
+```
+
+> Keep this terminal open. Do not close it.
 
 ---
 
-### 3️⃣ Step 3: Set Up & Run React Frontend
+### 🖥️ TERMINAL 3 — React Frontend (Web App)
 
-Open a third terminal in the project root directory:
+Open a **third** terminal, then run:
 
-```bash
+**Step 1 — Go to the project root:**
+```powershell
 cd "senior AI"
 ```
 
-Install frontend dependencies:
+**Step 2 — Install dependencies (first time only):**
 ```bash
 npm install
 ```
 
-Start the Vite development server:
+**Step 3 — Start the frontend:**
 ```bash
 npm run dev
 ```
 
-The frontend web app will be live at:
-```text
+✅ You should see:
+```
+VITE v5.x.x  ready in ...ms
+➜  Local:   http://localhost:5173/
+```
+
+---
+
+### ✅ Everything is Running — Open the App
+
+Open your browser and go to:
+
+```
 http://localhost:5173/
 ```
 
-Open `http://localhost:5173/` in your browser, allow microphone permissions, tap the big blue microphone button, and start talking to Bhavi!
+1. Allow **microphone access** when the browser asks
+2. Tap the **big blue microphone button**
+3. Speak clearly for 2–3 seconds
+4. Release the button and wait for Bhavi to respond
+
+---
+
+### 🔁 Every Time You Start (After First Setup)
+
+After the first setup, you only need to run these 3 commands in 3 terminals:
+
+| Terminal | Command |
+| :--- | :--- |
+| Terminal 1 | `ollama serve` |
+| Terminal 2 | `cd backend` → activate venv → `python manage.py runserver` |
+| Terminal 3 | `npm run dev` |
+
+---
+
+### ❌ Common Errors & Fixes
+
+| Error | Cause | Fix |
+| :--- | :--- | :--- |
+| `503 Service Unavailable` | Ollama is not running | Run `ollama serve` in Terminal 1 |
+| `503 Service Unavailable` | Django is not running | Run `python manage.py runserver` in Terminal 2 |
+| `422 Unprocessable Entity` | No speech detected in audio | Speak clearly for 2–3 seconds after pressing the mic button |
+| `bind: Only one usage of each socket` | Ollama is already running | This is fine — skip `ollama serve`, it's already active |
+| `ModuleNotFoundError` | Virtual environment not activated | Run `.\venv\Scripts\Activate.ps1` first, then retry |
+| Mic not working | Browser blocked microphone | Click the 🔒 icon in the browser address bar → Allow microphone |
 
 ---
 

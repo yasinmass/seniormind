@@ -16,6 +16,9 @@ from .services.memory import (
     generate_session_id,
 )
 from .services import memory_store
+from .services.memory_extractor import extract_and_persist_memories
+from .services.risk_detector import analyze_risk
+from .models import SafetyEvent
 
 
 def health_check(request):
@@ -158,6 +161,51 @@ def upload_audio(request):
         except Exception as turn_err:
             print(f"[AudioAPI] Warning: Failed to save turn to memory: {turn_err}", flush=True)
 
+        # ── Step 5c: Stage 8.3 Extract and persist memories (non-fatal) ────────
+        extracted_memories = []
+        try:
+            extracted_memories = extract_and_persist_memories(
+                transcript=transcript_text,
+                user_identifier=user_identifier,
+                user=user_obj,
+            )
+            if extracted_memories:
+                print(
+                    f"[AudioAPI] Extracted and persisted {len(extracted_memories)} memory item(s) "
+                    f"for user [{user_identifier}]",
+                    flush=True,
+                )
+        except Exception as extract_err:
+            print(f"[AudioAPI] Warning: Memory extraction failed (non-fatal): {extract_err}", flush=True)
+
+        # ── Step 5d: Stage 9 Risk Detection (non-fatal) ───────────────────────
+        risk_result = {
+            "risk_level": "LOW",
+            "category": "NONE",
+            "reason": "",
+            "requires_attention": False,
+        }
+        try:
+            risk_result = analyze_risk(transcript_text)
+            if risk_result.get("requires_attention"):
+                # Store a safety event — only when there is something worth noting
+                relevant_excerpt = transcript_text[:200] if transcript_text else ""
+                SafetyEvent.objects.create(
+                    user_identifier=user_identifier,
+                    risk_level=risk_result["risk_level"],
+                    category=risk_result["category"],
+                    reason=risk_result.get("reason", ""),
+                    relevant_text=relevant_excerpt,
+                    status="NEW",
+                )
+                print(
+                    f"[AudioAPI] Safety event stored for [{user_identifier}]: "
+                    f"{risk_result['risk_level']}/{risk_result['category']}",
+                    flush=True,
+                )
+        except Exception as risk_err:
+            print(f"[AudioAPI] Warning: Risk detection failed (non-fatal): {risk_err}", flush=True)
+
         # ── Step 6: TTS → Bhavi audio ─────────────────────────────────────────
         audio_b64 = None
         audio_format = None
@@ -189,6 +237,20 @@ def upload_audio(request):
             "response": bhavi_response,        # Bhavi text response
             "conversation_id": conversation_id,# Session ID for conversation tracking
         }
+
+        # Always include risk in response so frontend can display/log it
+        response_payload["risk"] = risk_result
+
+        if extracted_memories:
+            response_payload["extracted_memories"] = [
+                {
+                    "id": m.id,
+                    "memory_type": m.memory_type,
+                    "key": m.key,
+                    "value": m.value,
+                }
+                for m in extracted_memories
+            ]
 
         if audio_b64:
             response_payload["audio_b64"]    = audio_b64
@@ -364,3 +426,182 @@ def manage_single_memory(request, memory_id):
             })
         except ValueError as val_err:
             return JsonResponse({"status": "error", "error": str(val_err)}, status=400)
+
+
+# ── REST Endpoints for Stage 10 Caregiver Dashboard ─────────────────────────────
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def caregiver_overview(request, user_identifier=None):
+    """
+    Stage 10 — Caregiver Dashboard overview endpoint.
+    Retrieves elder profile, overall safety status, active SafetyEvent alerts,
+    persistent UserMemory insights, and recent synthesized activity timeline.
+    """
+    if not user_identifier or not str(user_identifier).strip():
+        user_identifier = request.GET.get("user_identifier") or request.headers.get("X-User-Identifier") or "default_user"
+    user_identifier = str(user_identifier).strip()
+
+    # 1. Fetch Safety Events (sorted by newest first)
+    events_qs = SafetyEvent.objects.filter(user_identifier=user_identifier).order_by("-created_at")[:25]
+    safety_events = [
+        {
+            "id": e.id,
+            "user_identifier": e.user_identifier,
+            "risk_level": e.risk_level,
+            "category": e.category,
+            "category_display": e.get_category_display(),
+            "reason": e.reason,
+            "relevant_text": e.relevant_text,
+            "status": e.status,
+            "created_at": e.created_at.isoformat(),
+        }
+        for e in events_qs
+    ]
+
+    # 2. Fetch User Memories (sorted by newest updated first)
+    from .models import UserMemory
+    memories_qs = UserMemory.objects.filter(user_identifier=user_identifier).order_by("-updated_at")[:25]
+    recent_memories = [
+        {
+            "id": m.id,
+            "user_identifier": m.user_identifier,
+            "memory_type": m.memory_type,
+            "memory_type_display": m.get_memory_type_display(),
+            "key": m.key,
+            "value": m.value,
+            "created_at": m.created_at.isoformat(),
+            "updated_at": m.updated_at.isoformat(),
+        }
+        for m in memories_qs
+    ]
+
+    # 3. Determine Overall Status & Risk Counts
+    critical_count = 0
+    high_count = 0
+    medium_count = 0
+    new_alerts_count = 0
+
+    for e in events_qs:
+        if e.status == "NEW":
+            new_alerts_count += 1
+        if e.status in ("NEW", "REVIEWED"):
+            if e.risk_level == "CRITICAL":
+                critical_count += 1
+            elif e.risk_level == "HIGH":
+                high_count += 1
+            elif e.risk_level == "MEDIUM":
+                medium_count += 1
+
+    if critical_count > 0:
+        overall_status = "CRITICAL"
+        status_label = "Immediate Attention Required"
+    elif high_count > 0:
+        overall_status = "HIGH_RISK"
+        status_label = "High Safety Risk Detected"
+    elif medium_count > 0:
+        overall_status = "ATTENTION_REQUIRED"
+        status_label = "Potential Safety Concern"
+    else:
+        overall_status = "STABLE"
+        status_label = "Stable"
+
+    # 4. Synthesize Recent Activity Timeline
+    activity_list = []
+    for e in events_qs:
+        activity_list.append({
+            "type": "safety_event",
+            "id": f"event_{e.id}",
+            "title": f"{e.get_category_display()} concern ({e.risk_level})",
+            "subtitle": e.reason or e.relevant_text,
+            "severity": e.risk_level,
+            "timestamp": e.created_at.isoformat(),
+        })
+
+    for m in memories_qs:
+        activity_list.append({
+            "type": "memory",
+            "id": f"mem_{m.id}",
+            "title": f"Memory remembered ({m.get_memory_type_display()})",
+            "subtitle": f"{m.key.replace('_', ' ').title()}: {m.value}",
+            "severity": "LOW",
+            "timestamp": m.updated_at.isoformat(),
+        })
+
+    activity_list.sort(key=lambda x: x["timestamp"], reverse=True)
+
+    # 5. Last Interaction Excerpt
+    last_interaction = None
+    if events_qs.exists():
+        last_ev = events_qs.first()
+        last_interaction = {
+            "text": last_ev.relevant_text or last_ev.reason,
+            "timestamp": last_ev.created_at.isoformat(),
+            "risk_level": last_ev.risk_level,
+        }
+    elif memories_qs.exists():
+        last_mem = memories_qs.first()
+        last_interaction = {
+            "text": f"Saved memory: {last_mem.key} = {last_mem.value}",
+            "timestamp": last_mem.updated_at.isoformat(),
+            "risk_level": "LOW",
+        }
+
+    elder_profile = {
+        "name": "Raj Kumar",
+        "user_identifier": user_identifier,
+        "age": 78,
+        "location": "Chennai",
+    }
+
+    return JsonResponse({
+        "status": "ok",
+        "user_identifier": user_identifier,
+        "elder_profile": elder_profile,
+        "overall_status": overall_status,
+        "status_label": status_label,
+        "last_interaction": last_interaction,
+        "safety_events": safety_events,
+        "recent_memories": recent_memories,
+        "recent_activity": activity_list[:12],
+        "summary": {
+            "total_alerts": len(safety_events),
+            "new_alerts": new_alerts_count,
+            "critical_alerts": critical_count,
+            "high_alerts": high_count,
+            "medium_alerts": medium_count,
+            "total_memories": len(recent_memories),
+        },
+    })
+
+
+@csrf_exempt
+@require_http_methods(["POST", "PUT"])
+def update_safety_event(request, event_id):
+    """
+    Caregiver status update for a safety event (NEW -> REVIEWED / RESOLVED).
+    """
+    try:
+        event = SafetyEvent.objects.get(id=event_id)
+    except SafetyEvent.DoesNotExist:
+        return JsonResponse({"status": "error", "error": "Safety event not found"}, status=404)
+
+    try:
+        body = json.loads(request.body.decode("utf-8")) if request.body else {}
+    except json.JSONDecodeError:
+        body = {}
+
+    new_status = body.get("status") or request.POST.get("status")
+    if new_status in ["NEW", "REVIEWED", "RESOLVED"]:
+        event.status = new_status
+        event.save()
+        return JsonResponse({
+            "status": "ok",
+            "event": {
+                "id": event.id,
+                "status": event.status,
+                "risk_level": event.risk_level,
+                "category": event.category,
+            }
+        })
+    return JsonResponse({"status": "error", "error": "Invalid status. Allowed: NEW, REVIEWED, RESOLVED"}, status=400)

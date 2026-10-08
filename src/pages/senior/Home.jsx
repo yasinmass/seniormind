@@ -105,11 +105,12 @@ export default function Home({ name, inConversation, onEnterConversation, onExit
       });
   };
 
-  // ── Called by VoiceButton on first tap (idle → listening) ─────────────────
+  // ── Called by VoiceButton on start recording ─────────────────────────────
   const startConversation = () => {
-    if (inConversation) return;
     getOrCreateSessionId();
-    onEnterConversation();
+    if (!inConversation) {
+      onEnterConversation();
+    }
     setState("listening");
   };
 
