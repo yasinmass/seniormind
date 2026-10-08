@@ -11,9 +11,27 @@ https://docs.djangoproject.com/en/6.1/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+# Load environment variables from backend/.env
+env_file = BASE_DIR / '.env'
+if env_file.exists():
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(env_file, override=True)
+    except ImportError:
+        with open(env_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, val = line.split('=', 1)
+                    key = key.strip()
+                    val = val.strip().strip("'\"")
+                    if key and val:
+                        os.environ[key] = val
 
 
 # Quick-start development settings - unsuitable for production

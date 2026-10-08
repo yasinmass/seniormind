@@ -21,7 +21,7 @@ import os
 import sys
 import wave
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 # ── Base Directory ─────────────────────────────────────────────────────────────
 _BACKEND_DIR = Path(__file__).resolve().parents[2]  # backend/
@@ -136,39 +136,103 @@ def _get_piper_voice(lang_code: str):
 
 # ── Public Interface ───────────────────────────────────────────────────────────
 
-def generate_speech(text: str, language: Optional[str] = "en") -> bytes:
+def generate_speech(
+    text: str,
+    language: Optional[str] = "en",
+    user_identifier: Optional[str] = None,
+) -> Tuple[bytes, str]:
     """
-    Convert text to speech in the specified language and return raw WAV audio bytes.
+    Convert text to speech in the specified language, returning a tuple of (audio_bytes, audio_format).
 
     Args:
-        text:     The text to synthesise. Empty/whitespace strings return empty bytes.
-        language: Language code ("en", "hi", "ta", etc.). Falls back to "en" if missing/unsupported.
+        text:            The text to synthesize. Empty/whitespace strings return (b"", "wav").
+        language:        Language code ("en", "hi", "ta", etc.). Defaults to "en".
+        user_identifier: Optional user identifier string to check for personalized voice preferences.
 
     Returns:
-        bytes: A valid WAV file as raw bytes.
+        Tuple[bytes, str]: (audio_bytes, "wav") or (audio_bytes, "mp3").
 
     Raises:
-        FileNotFoundError: If the voice model file for the language is missing.
+        FileNotFoundError: If the Piper voice model file for the language is missing.
         ImportError:       If piper-tts is not installed.
-        RuntimeError:      For synthesis failure or unknown provider.
+        RuntimeError:      For synthesis failure or unknown default provider.
     """
     if not text or not text.strip():
         print("[TTS] Empty text received — skipping synthesis", flush=True)
-        return b""
+        return b"", "wav"
 
+    # 1. Check for personalized voice preference (OpenVoice or ElevenLabs) if user_identifier is provided
+    if user_identifier and str(user_identifier).strip():
+        try:
+            from voice.models import UserVoicePreference
+            pref = UserVoicePreference.objects.filter(user_identifier=user_identifier).first()
+            if pref:
+                # ── OpenVoice V2 (Local / Free) ─────────────────────────────
+                if pref.provider == "openvoice" and pref.openvoice_reference_path.strip():
+                    ref_audio = pref.openvoice_reference_path.strip()
+                    print(
+                        f"[TTS] Personalized OpenVoice V2 configured for [{user_identifier}] "
+                        f"(reference: '{os.path.basename(ref_audio)}')",
+                        flush=True,
+                    )
+                    from .openvoice_tts import generate_openvoice_speech
+                    try:
+                        audio_bytes, audio_fmt = generate_openvoice_speech(
+                            text=text.strip(),
+                            reference_audio=ref_audio,
+                        )
+                        if audio_bytes:
+                            return audio_bytes, audio_fmt
+                    except Exception as ov_err:
+                        print(
+                            f"[TTS] OpenVoice personalized voice failed (non-fatal): {ov_err}. "
+                            "Automatically falling back to local Piper TTS.",
+                            flush=True,
+                        )
+
+                # ── ElevenLabs (Cloud) ──────────────────────────────────────
+                elif pref.provider == "elevenlabs" and pref.elevenlabs_voice_id.strip():
+                    print(
+                        f"[TTS] Personalized voice configured for [{user_identifier}] "
+                        f"(ElevenLabs voice_id: '{pref.elevenlabs_voice_id[:6]}...')",
+                        flush=True,
+                    )
+                    from .elevenlabs_tts import synthesize_elevenlabs
+                    try:
+                        audio_bytes, audio_fmt = synthesize_elevenlabs(
+                            text=text.strip(),
+                            voice_id=pref.elevenlabs_voice_id.strip(),
+                            language=language,
+                        )
+                        if audio_bytes:
+                            return audio_bytes, audio_fmt
+                    except Exception as el_err:
+                        print(
+                            f"[TTS] ElevenLabs personalized voice failed (non-fatal): {el_err}. "
+                            "Automatically falling back to local Piper TTS.",
+                            flush=True,
+                        )
+        except Exception as db_err:
+            print(
+                f"[TTS] Warning: Failed to check UserVoicePreference ({db_err}). "
+                "Proceeding with standard Piper TTS.",
+                flush=True,
+            )
+
+    # 2. Standard Default Provider: Piper TTS
     provider = TTS_PROVIDER.lower()
-
     if provider == "piper":
         lang_code = _normalize_language(language)
         voice_name = VOICE_NAMES.get(lang_code, "en_US-lessac-medium")
-        print(f"[TTS] Language: {lang_code}", flush=True)
-        print(f"[TTS] Voice: {voice_name}", flush=True)
-        return _synthesise_piper(text.strip(), lang_code)
+        print(f"[TTS] Piper synthesis — Language: {lang_code}, Voice: {voice_name}", flush=True)
+        wav_bytes = _synthesise_piper(text.strip(), lang_code)
+        return wav_bytes, "wav"
 
     raise RuntimeError(
         f"[TTS] Unknown provider: '{TTS_PROVIDER}'. "
         "Set TTS_PROVIDER=piper (or another supported provider)."
     )
+
 
 
 def _synthesise_piper(text: str, lang_code: str) -> bytes:

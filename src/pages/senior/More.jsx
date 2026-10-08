@@ -1,15 +1,18 @@
-import React from "react";
-import { Sun, Moon, User, Languages, Volume2, Bell, Users, PhoneCall, HelpCircle } from "lucide-react";
+import React, { useState } from "react";
+import { Sun, Moon, User, Languages, Volume2, Bell, Users, PhoneCall, HelpCircle, ChevronDown, ChevronUp } from "lucide-react";
 import { useTheme } from "../../context/ThemeContext";
 import ScreenShell from "../../components/senior/ScreenShell";
 import TopBar from "../../components/senior/TopBar";
 import SettingsRow from "../../components/senior/SettingsRow";
 import SettingsToggleRow from "../../components/senior/SettingsToggleRow";
+import VoiceEnrollment from "../../components/senior/VoiceEnrollment";
 import { seniorProfile } from "../../data/seniorMockData";
 
 export default function More({ goHelp, name }) {
   const { theme, mode, toggleTheme } = useTheme();
+  const [showVoiceEnrollment, setShowVoiceEnrollment] = useState(false);
   const displayName = name || seniorProfile.name;
+
   return (
     <ScreenShell bottomPad>
       <TopBar title="More" />
@@ -25,7 +28,17 @@ export default function More({ goHelp, name }) {
         </div>
         <SettingsRow icon={User}      label="My Profile" />
         <SettingsRow icon={Languages} label="Language"         value="English"       />
-        <SettingsRow icon={Volume2}   label="Voice"            value="Warm & Gentle" />
+        <SettingsRow
+          icon={Volume2}
+          label="Personalized Voice"
+          value={showVoiceEnrollment ? "Hide Settings" : "Configure"}
+          onClick={() => setShowVoiceEnrollment((prev) => !prev)}
+        />
+        {showVoiceEnrollment && (
+          <div style={{ marginBottom: 20 }}>
+            <VoiceEnrollment userIdentifier="default_user" />
+          </div>
+        )}
         <SettingsRow icon={Bell}      label="Notifications"    value="On"            />
         <SettingsToggleRow icon={mode === "dark" ? Moon : Sun} label="Dark Mode" checked={mode === "dark"} onChange={toggleTheme} />
         <SettingsRow icon={Users}     label="My Family"          />
@@ -35,3 +48,4 @@ export default function More({ goHelp, name }) {
     </ScreenShell>
   );
 }
+

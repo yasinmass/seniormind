@@ -139,3 +139,53 @@ class SafetyEvent(models.Model):
             f"[{self.user_identifier}] {self.risk_level}/{self.category} "
             f"@ {self.created_at.strftime('%Y-%m-%d %H:%M') if self.created_at else '?'}"
         )
+
+
+class UserVoicePreference(models.Model):
+    """
+    Stores optional per-user personalized voice configuration (e.g. ElevenLabs voice_id).
+    Piper remains the default fallback provider.
+    No audio recordings are stored in this model.
+    """
+
+    PROVIDER_CHOICES = (
+        ("piper", "Piper"),
+        ("elevenlabs", "ElevenLabs"),
+        ("openvoice", "OpenVoice (Local)"),
+    )
+
+    user_identifier = models.CharField(
+        max_length=150,
+        unique=True,
+        db_index=True,
+        help_text="User identifier for voice preference ownership.",
+    )
+    provider = models.CharField(
+        max_length=20,
+        choices=PROVIDER_CHOICES,
+        default="piper",
+        help_text="TTS provider ('piper', 'elevenlabs', or 'openvoice').",
+    )
+    elevenlabs_voice_id = models.CharField(
+        max_length=100,
+        blank=True,
+        default="",
+        help_text="Optional custom ElevenLabs voice ID for personalized voice cloning.",
+    )
+    openvoice_reference_path = models.CharField(
+        max_length=500,
+        blank=True,
+        default="",
+        help_text="Optional local file path to reference voice audio for OpenVoice V2 cloning.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "User Voice Preference"
+        verbose_name_plural = "User Voice Preferences"
+        ordering = ["-updated_at"]
+
+    def __str__(self):
+        return f"[{self.user_identifier}] provider={self.provider} voice_id={self.elevenlabs_voice_id}"
+

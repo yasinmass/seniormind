@@ -21,7 +21,8 @@ from voice.services.tts import generate_speech
 def test_language(name, text, lang_code, expected_min_duration=0.5):
     print(f"=== Testing {name} (code: {repr(lang_code)}) ===")
     print(f"Text: {text}")
-    wav_bytes = generate_speech(text, lang_code)
+    res = generate_speech(text, lang_code)
+    wav_bytes = res[0] if isinstance(res, tuple) else res
     
     assert len(wav_bytes) > 0, f"Error: Got empty bytes for {name}"
     

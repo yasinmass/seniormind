@@ -68,3 +68,9 @@ staticfiles/
 # TTS — generated audio test files and large model binaries
 backend/models/
 backend/test_tts*.wav
+
+# Personalized voice reference audio — user recordings, never commit
+backend/voice_references/
+
+# OpenVoice test output (generated audio, voice samples)
+backend/test_output/

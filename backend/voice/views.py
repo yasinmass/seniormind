@@ -4,6 +4,9 @@ import os
 import sys
 import tempfile
 import traceback
+import uuid
+from pathlib import Path
+from django.conf import settings
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods, require_POST
@@ -18,7 +21,60 @@ from .services.memory import (
 from .services import memory_store
 from .services.memory_extractor import extract_and_persist_memories
 from .services.risk_detector import analyze_risk
-from .models import SafetyEvent
+from .models import SafetyEvent, UserVoicePreference
+
+# ── OpenVoice reference audio storage ──────────────────────────────────────────
+# Stored under BASE_DIR/voice_references/ — never inside SQLite.
+_VOICE_REFERENCES_DIR = Path(settings.BASE_DIR) / "voice_references"
+
+# Supported audio MIME types / extensions accepted for enrollment
+_ALLOWED_AUDIO_EXTENSIONS = {".webm", ".wav", ".mp3", ".ogg", ".m4a", ".mp4", ".flac"}
+_ALLOWED_AUDIO_CONTENT_TYPES = {
+    "audio/webm", "audio/wav", "audio/x-wav", "audio/mpeg",
+    "audio/mp3", "audio/ogg", "audio/mp4", "audio/flac",
+    "audio/x-m4a", "video/webm",  # Chrome sometimes labels webm as video/webm
+}
+# Minimum enrollment file size: ~20s of 16 kbps audio ≈ 40 KB
+_MIN_AUDIO_SIZE_BYTES = 40_000
+# Maximum: 50 MB should be far more than enough
+_MAX_AUDIO_SIZE_BYTES = 50 * 1024 * 1024
+
+
+def _ensure_voice_references_dir():
+    """Create the voice_references directory if it does not already exist."""
+    _VOICE_REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
+    return _VOICE_REFERENCES_DIR
+
+
+def _safe_remove_reference_file(file_path: str, user_identifier: str) -> bool:
+    """
+    Remove a stored reference audio file only if it is not used by any other
+    UserVoicePreference. Returns True if the file was removed, False otherwise.
+    """
+    if not file_path or not str(file_path).strip():
+        return False
+    clean_path = str(file_path).strip()
+    # Check whether any OTHER user references the same physical file
+    others = UserVoicePreference.objects.filter(
+        openvoice_reference_path=clean_path,
+    ).exclude(user_identifier=user_identifier)
+    if others.exists():
+        print(
+            f"[VoiceEnroll] Reference file shared with {others.count()} other user(s) — NOT deleting.",
+            flush=True,
+        )
+        return False
+    try:
+        path_obj = Path(clean_path)
+        if path_obj.is_file():
+            path_obj.unlink()
+            print(f"[VoiceEnroll] Deleted reference file: {clean_path}", flush=True)
+            return True
+        else:
+            print(f"[VoiceEnroll] Reference file not found on disk (already removed?): {clean_path}", flush=True)
+    except OSError as err:
+        print(f"[VoiceEnroll] Warning: Could not delete reference file {clean_path}: {err}", flush=True)
+    return False
 
 
 def health_check(request):
@@ -211,13 +267,16 @@ def upload_audio(request):
         audio_format = None
 
         try:
-            wav_bytes = generate_speech(bhavi_response, detected_language)
-            if wav_bytes:
-                audio_b64 = base64.b64encode(wav_bytes).decode("utf-8")
-                audio_format = "wav"
+            audio_bytes, audio_format = generate_speech(
+                bhavi_response,
+                detected_language,
+                user_identifier=user_identifier,
+            )
+            if audio_bytes:
+                audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
                 print(
                     f"[AudioAPI] TTS audio encoded "
-                    f"({len(wav_bytes) // 1024} KB → {len(audio_b64)} chars base64)",
+                    f"({len(audio_bytes) // 1024} KB {audio_format.upper()} → {len(audio_b64)} chars base64)",
                     flush=True,
                 )
             else:
@@ -226,6 +285,7 @@ def upload_audio(request):
             print(f"[AudioAPI] TTS failed (non-fatal): {tts_err}", flush=True)
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
+
 
         # ── Step 7: Return full response ──────────────────────────────────────
         print("[AudioAPI] Returning response", flush=True)
@@ -605,3 +665,489 @@ def update_safety_event(request, event_id):
             }
         })
     return JsonResponse({"status": "error", "error": "Invalid status. Allowed: NEW, REVIEWED, RESOLVED"}, status=400)
+
+
+# ── Stage 11 Phase 3 — Personalized Voice Enrollment ────────────────────────────
+
+_REQUIRED_CONSENT_TEXT = (
+    "I confirm that I own this voice or have permission from the voice owner "
+    "to create and use this voice."
+)
+
+@csrf_exempt
+@require_POST
+def enroll_personalized_voice(request):
+    """
+    POST /api/voice/personalized/
+
+    Upload a voice sample and create an ElevenLabs cloned voice for this user.
+
+    Expects multipart/form-data:
+        audio          (required) – voice sample audio file
+        user_identifier(required) – string that identifies this elder user
+        consent        (required) – must equal the exact consent text
+        voice_name     (optional) – friendly name for the cloned voice
+
+    On success:
+        - Calls ElevenLabs Voice Cloning API
+        - Saves voice_id into UserVoicePreference (provider = 'elevenlabs')
+        - Returns {status: 'ok', voice_id: '...'}
+
+    The raw audio file is NEVER persisted to disk permanently.
+    The API key is NEVER returned or logged.
+    """
+    # ── Step 1: Extract user identifier ──────────────────────────────────────
+    user_identifier = (
+        request.POST.get("user_identifier")
+        or request.headers.get("X-User-Identifier")
+        or ""
+    ).strip()
+
+    if not user_identifier:
+        return JsonResponse(
+            {"status": "error", "error": "user_identifier is required."},
+            status=400,
+        )
+
+    # ── Step 2: Enforce consent ───────────────────────────────────────────────
+    consent_text = (request.POST.get("consent") or "").strip()
+    if consent_text != _REQUIRED_CONSENT_TEXT:
+        return JsonResponse(
+            {
+                "status": "error",
+                "error": (
+                    "Consent not confirmed. You must agree: \""
+                    + _REQUIRED_CONSENT_TEXT
+                    + "\""
+                ),
+            },
+            status=400,
+        )
+
+    # ── Step 3: Validate uploaded audio file ─────────────────────────────────
+    audio_file = request.FILES.get("audio")
+    if not audio_file:
+        return JsonResponse(
+            {"status": "error", "error": "Audio file is required."},
+            status=400,
+        )
+
+    # ── Step 4: Read audio bytes (do NOT write to disk permanently) ───────────
+    try:
+        audio_bytes = b"".join(chunk for chunk in audio_file.chunks())
+    except Exception as read_err:
+        print(f"[VoiceEnroll] Failed to read audio file: {read_err}", flush=True)
+        return JsonResponse(
+            {"status": "error", "error": "Failed to read audio file."},
+            status=400,
+        )
+
+    if not audio_bytes:
+        return JsonResponse(
+            {"status": "error", "error": "Uploaded audio file is empty."},
+            status=400,
+        )
+
+    voice_name = (request.POST.get("voice_name") or "").strip()
+    audio_filename = audio_file.name or "sample.webm"
+
+    print(
+        f"[VoiceEnroll] Enrollment request from [{user_identifier}] — "
+        f"{len(audio_bytes) // 1024} KB, filename='{audio_filename}'",
+        flush=True,
+    )
+
+    # ── Step 5: Call ElevenLabs Voice Cloning API ─────────────────────────────
+    try:
+        from .services.elevenlabs_voice import clone_voice
+        voice_id = clone_voice(
+            audio_bytes=audio_bytes,
+            audio_filename=audio_filename,
+            name=voice_name,
+            description=f"Bhavi personalized voice for user '{user_identifier}'",
+        )
+    except ValueError as val_err:
+        print(f"[VoiceEnroll] Validation error: {val_err}", flush=True)
+        return JsonResponse({"status": "error", "error": str(val_err)}, status=400)
+    except RuntimeError as rt_err:
+        print(f"[VoiceEnroll] ElevenLabs clone failed: {rt_err}", flush=True)
+        return JsonResponse(
+            {
+                "status": "error",
+                "error": (
+                    "Voice cloning failed. Please check your ElevenLabs API key and try again. "
+                    f"Detail: {rt_err}"
+                ),
+            },
+            status=502,
+        )
+    except Exception as clone_err:
+        print(f"[VoiceEnroll] Unexpected error: {clone_err}", flush=True)
+        traceback.print_exc(file=sys.stdout)
+        return JsonResponse(
+            {"status": "error", "error": "An unexpected error occurred during voice cloning."},
+            status=500,
+        )
+    finally:
+        # Explicitly release audio bytes from memory as soon as we're done
+        audio_bytes = None
+
+    # ── Step 6: Persist voice_id in UserVoicePreference ──────────────────────
+    try:
+        pref, created = UserVoicePreference.objects.update_or_create(
+            user_identifier=user_identifier,
+            defaults={
+                "provider": "elevenlabs",
+                "elevenlabs_voice_id": voice_id,
+            },
+        )
+        print(
+            f"[VoiceEnroll] UserVoicePreference {'created' if created else 'updated'} "
+            f"for [{user_identifier}] — provider=elevenlabs, "
+            f"voice_id='{voice_id[:6]}...'",
+            flush=True,
+        )
+    except Exception as db_err:
+        print(f"[VoiceEnroll] Failed to save preference to DB: {db_err}", flush=True)
+        return JsonResponse(
+            {"status": "error", "error": "Voice cloned successfully but could not save preference. Please try again."},
+            status=500,
+        )
+
+    return JsonResponse({
+        "status": "ok",
+        "message": "Personalized voice enrolled successfully. Bhavi will now speak in your voice.",
+        "provider": "elevenlabs",
+        # Return only a short prefix — full voice_id is not needed by the frontend
+        "voice_id_prefix": voice_id[:6] + "...",
+    })
+
+
+@csrf_exempt
+@require_POST
+def enroll_openvoice_voice(request):
+    """
+    POST /api/voice/personalized/openvoice/
+
+    Upload a voice sample and enroll it as this user's OpenVoice V2 reference.
+    The audio is stored as a file on the local filesystem — NEVER in SQLite.
+    The physical path is NEVER returned to the frontend.
+
+    Expects multipart/form-data:
+        audio           (required) – voice sample audio file
+        user_identifier (required) – string that identifies this elder user
+        consent         (required) – must equal the exact consent text
+        voice_name      (optional) – friendly label (stored for display only)
+
+    On success:
+        - Stores the audio file under BASE_DIR/voice_references/<user_identifier>/
+        - Updates UserVoicePreference: provider='openvoice', openvoice_reference_path=<path>
+        - Returns {"status": "ok", "provider": "openvoice", "enabled": true}
+    """
+    # ── Step 1: Extract and validate user_identifier ──────────────────────────
+    user_identifier = (
+        request.POST.get("user_identifier")
+        or request.headers.get("X-User-Identifier")
+        or ""
+    ).strip()
+
+    if not user_identifier:
+        return JsonResponse(
+            {"status": "error", "error": "user_identifier is required."},
+            status=400,
+        )
+
+    # Basic sanity — reject path traversal characters in user_identifier
+    if any(c in user_identifier for c in ("/", "\\", "..", ":", "\0")):
+        return JsonResponse(
+            {"status": "error", "error": "Invalid user_identifier."},
+            status=400,
+        )
+
+    # ── Step 2: Enforce consent ───────────────────────────────────────────────
+    consent_text = (request.POST.get("consent") or "").strip()
+    if consent_text != _REQUIRED_CONSENT_TEXT:
+        return JsonResponse(
+            {
+                "status": "error",
+                "error": (
+                    "Consent not confirmed. You must agree: \""
+                    + _REQUIRED_CONSENT_TEXT
+                    + "\""
+                ),
+            },
+            status=400,
+        )
+
+    # ── Step 3: Validate uploaded audio file ─────────────────────────────────
+    audio_file = request.FILES.get("audio")
+    if not audio_file:
+        return JsonResponse(
+            {"status": "error", "error": "Audio file is required."},
+            status=400,
+        )
+
+    audio_filename = audio_file.name or "sample.webm"
+    file_ext = os.path.splitext(audio_filename)[1].lower() or ".webm"
+    content_type = (audio_file.content_type or "").lower().split(";")[0].strip()
+
+    # Extension check
+    if file_ext not in _ALLOWED_AUDIO_EXTENSIONS:
+        return JsonResponse(
+            {
+                "status": "error",
+                "error": f"Unsupported audio format '{file_ext}'. Supported: webm, wav, mp3, ogg, m4a, flac.",
+            },
+            status=400,
+        )
+
+    # Content-type check (permissive — browser may send video/webm for audio recordings)
+    if content_type and content_type not in _ALLOWED_AUDIO_CONTENT_TYPES:
+        print(
+            f"[VoiceEnroll/OV] Unusual content-type '{content_type}' for user [{user_identifier}] — proceeding cautiously.",
+            flush=True,
+        )
+
+    # Size check
+    if audio_file.size < _MIN_AUDIO_SIZE_BYTES:
+        return JsonResponse(
+            {
+                "status": "error",
+                "error": (
+                    f"Recording is too short ({audio_file.size // 1024} KB). "
+                    "Please record at least 20–30 seconds of clear speech."
+                ),
+            },
+            status=400,
+        )
+
+    if audio_file.size > _MAX_AUDIO_SIZE_BYTES:
+        return JsonResponse(
+            {
+                "status": "error",
+                "error": "Audio file is too large (maximum 50 MB).",
+            },
+            status=400,
+        )
+
+    print(
+        f"[VoiceEnroll/OV] OpenVoice enrollment from [{user_identifier}] — "
+        f"{audio_file.size // 1024} KB, ext='{file_ext}'",
+        flush=True,
+    )
+
+    # ── Step 4: Store audio file to local filesystem ──────────────────────────
+    # Path: voice_references/<user_identifier>/<uuid><ext>
+    # Never store the path in SQLite — only store the resolved string path.
+    try:
+        user_dir = _ensure_voice_references_dir() / user_identifier
+        user_dir.mkdir(parents=True, exist_ok=True)
+
+        unique_name = f"{uuid.uuid4().hex}{file_ext}"
+        dest_path = user_dir / unique_name
+
+        with open(dest_path, "wb") as out_file:
+            for chunk in audio_file.chunks():
+                out_file.write(chunk)
+
+        stored_path = str(dest_path.resolve())
+        print(
+            f"[VoiceEnroll/OV] Reference audio saved ({audio_file.size // 1024} KB): {unique_name}",
+            flush=True,
+        )
+    except OSError as fs_err:
+        print(f"[VoiceEnroll/OV] Filesystem error saving reference: {fs_err}", flush=True)
+        return JsonResponse(
+            {"status": "error", "error": "Failed to save voice reference. Please try again."},
+            status=500,
+        )
+
+    # ── Step 5: Persist preference in UserVoicePreference ────────────────────
+    old_path = ""
+    try:
+        pref, created = UserVoicePreference.objects.get_or_create(
+            user_identifier=user_identifier,
+            defaults={
+                "provider": "openvoice",
+                "openvoice_reference_path": stored_path,
+            },
+        )
+        if not created:
+            # Capture old path before overwriting — may need cleanup
+            old_path = pref.openvoice_reference_path or ""
+            pref.provider = "openvoice"
+            pref.openvoice_reference_path = stored_path
+            pref.elevenlabs_voice_id = ""  # clear any previous ElevenLabs association
+            pref.save()
+
+        print(
+            f"[VoiceEnroll/OV] UserVoicePreference {'created' if created else 'updated'} "
+            f"for [{user_identifier}] — provider=openvoice",
+            flush=True,
+        )
+    except Exception as db_err:
+        # Cleanup the newly saved file so we don't leave orphans
+        try:
+            Path(stored_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+        print(f"[VoiceEnroll/OV] Failed to save preference: {db_err}", flush=True)
+        return JsonResponse(
+            {"status": "error", "error": "Voice sample saved but could not update preference. Please try again."},
+            status=500,
+        )
+
+    # ── Step 6: Safely remove the previous reference file (if any) ───────────
+    if old_path and old_path != stored_path:
+        _safe_remove_reference_file(old_path, user_identifier)
+
+    return JsonResponse({
+        "status": "ok",
+        "message": "Voice enrolled successfully. Bhavi will now speak in your voice.",
+        "provider": "openvoice",
+        "enabled": True,
+    })
+
+
+@csrf_exempt
+@require_POST
+def disable_personalized_voice(request):
+    """
+    POST /api/voice/personalized/disable/
+
+    Reset the user's TTS provider back to Piper (default).
+    Clears ElevenLabs voice_id and OpenVoice reference path (and safely removes
+    the stored reference file if it is not shared with another user).
+
+    Expects JSON or form-data:
+        user_identifier (required)
+    """
+    # Accept both JSON body and form POST
+    user_identifier = ""
+    try:
+        body = json.loads(request.body.decode("utf-8")) if request.body else {}
+        user_identifier = (
+            body.get("user_identifier")
+            or request.POST.get("user_identifier")
+            or request.headers.get("X-User-Identifier")
+            or ""
+        ).strip()
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        user_identifier = (
+            request.POST.get("user_identifier")
+            or request.headers.get("X-User-Identifier")
+            or ""
+        ).strip()
+
+    if not user_identifier:
+        return JsonResponse(
+            {"status": "error", "error": "user_identifier is required."},
+            status=400,
+        )
+
+    old_reference_path = ""
+    try:
+        pref = UserVoicePreference.objects.filter(user_identifier=user_identifier).first()
+        if pref:
+            old_reference_path = pref.openvoice_reference_path or ""
+            pref.provider = "piper"
+            pref.elevenlabs_voice_id = ""
+            pref.openvoice_reference_path = ""
+            pref.save()
+            print(
+                f"[VoiceEnroll] Personalized voice disabled for [{user_identifier}] — "
+                "reset to Piper TTS",
+                flush=True,
+            )
+        else:
+            print(
+                f"[VoiceEnroll] No preference found for [{user_identifier}] — nothing to disable",
+                flush=True,
+            )
+    except Exception as db_err:
+        print(f"[VoiceEnroll] Failed to disable preference: {db_err}", flush=True)
+        return JsonResponse(
+            {"status": "error", "error": "Failed to disable personalized voice."},
+            status=500,
+        )
+
+    # Safely attempt to clean up the stored reference file
+    if old_reference_path:
+        _safe_remove_reference_file(old_reference_path, user_identifier)
+
+    return JsonResponse({
+        "status": "ok",
+        "message": "Personalized voice disabled. Bhavi will now use the default voice.",
+        "provider": "piper",
+    })
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def get_voice_status(request):
+    """
+    GET /api/voice/personalized/status/?user_identifier=<uid>
+
+    Returns the current voice preference for a user in a safe,
+    provider-agnostic format. Never exposes filesystem paths or API keys.
+
+    Response format:
+        {"status": "ok", "enabled": bool, "provider": str}
+
+    For OpenVoice:  {"enabled": true,  "provider": "openvoice"}
+    For ElevenLabs: {"enabled": true,  "provider": "elevenlabs"}
+    For Piper:      {"enabled": false, "provider": "piper"}
+    """
+    user_identifier = (
+        request.GET.get("user_identifier")
+        or request.headers.get("X-User-Identifier")
+        or ""
+    ).strip()
+
+    if not user_identifier:
+        return JsonResponse(
+            {"status": "error", "error": "user_identifier is required."},
+            status=400,
+        )
+
+    pref = UserVoicePreference.objects.filter(user_identifier=user_identifier).first()
+    if not pref or pref.provider == "piper":
+        return JsonResponse({
+            "status": "ok",
+            "provider": "piper",
+            "enabled": False,
+            # Legacy field — keep for backward compatibility with old frontend code
+            "personalized_voice_active": False,
+            "voice_id_prefix": None,
+        })
+
+    if pref.provider == "openvoice":
+        has_reference = bool(pref.openvoice_reference_path.strip())
+        return JsonResponse({
+            "status": "ok",
+            "provider": "openvoice",
+            "enabled": has_reference,
+            # Legacy compatibility
+            "personalized_voice_active": has_reference,
+            "voice_id_prefix": None,
+        })
+
+    if pref.provider == "elevenlabs":
+        has_voice_id = bool(pref.elevenlabs_voice_id.strip())
+        return JsonResponse({
+            "status": "ok",
+            "provider": "elevenlabs",
+            "enabled": has_voice_id,
+            # Legacy compatibility
+            "personalized_voice_active": has_voice_id,
+            "voice_id_prefix": pref.elevenlabs_voice_id[:6] + "..." if has_voice_id else None,
+        })
+
+    # Fallback for unknown provider
+    return JsonResponse({
+        "status": "ok",
+        "provider": pref.provider,
+        "enabled": False,
+        "personalized_voice_active": False,
+        "voice_id_prefix": None,
+    })
