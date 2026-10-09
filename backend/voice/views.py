@@ -21,7 +21,13 @@ from .services.memory import (
 from .services import memory_store
 from .services.memory_extractor import extract_and_persist_memories
 from .services.risk_detector import analyze_risk
-from .models import SafetyEvent, UserVoicePreference
+from .models import (
+    SafetyEvent,
+    UserVoicePreference,
+    SeniorProfile,
+    CaregiverElderLink,
+    generate_unique_senior_id,
+)
 
 # ── OpenVoice reference audio storage ──────────────────────────────────────────
 # Stored under BASE_DIR/voice_references/ — never inside SQLite.
@@ -492,15 +498,62 @@ def manage_single_memory(request, memory_id):
 
 @csrf_exempt
 @require_http_methods(["GET"])
-def caregiver_overview(request, user_identifier=None):
+def caregiver_overview(request, user_identifier=None, _skip_auth=False):
     """
     Stage 10 — Caregiver Dashboard overview endpoint.
     Retrieves elder profile, overall safety status, active SafetyEvent alerts,
     persistent UserMemory insights, and recent synthesized activity timeline.
+
+    Authorization:
+    - Internal calls (e.g. from caregiver_linked_senior) pass _skip_auth=True and have
+      already verified the APPROVED link before calling this function.
+    - External HTTP callers must supply X-Senior-ID + X-Caretaker-Phone (or query params)
+      proving an APPROVED CaregiverElderLink to the target senior.
     """
     if not user_identifier or not str(user_identifier).strip():
         user_identifier = request.GET.get("user_identifier") or request.headers.get("X-User-Identifier") or "default_user"
     user_identifier = str(user_identifier).strip()
+
+    # ── Authorization gate ──────────────────────────────────────────────────
+    if not _skip_auth:
+        # Require caretaker to supply their credentials
+        req_senior_id = (
+            request.GET.get("senior_id")
+            or request.headers.get("X-Senior-ID")
+            or ""
+        ).strip()
+        req_phone = (
+            request.GET.get("phone_number")
+            or request.headers.get("X-Caretaker-Phone")
+            or ""
+        ).strip()
+
+        if not req_senior_id or not req_phone:
+            return JsonResponse({
+                "status": "error",
+                "error": "Authorization required. Supply senior_id and phone_number to access caregiver overview."
+            }, status=403)
+
+        # Verify that the senior_id maps to the requested user_identifier
+        profile = SeniorProfile.objects.filter(senior_id__iexact=req_senior_id).first()
+        if not profile or profile.user_identifier != user_identifier:
+            return JsonResponse({
+                "status": "error",
+                "error": "Access denied. Senior ID does not match the requested senior."
+            }, status=403)
+
+        # Verify APPROVED link
+        approved_link = CaregiverElderLink.objects.filter(
+            senior=profile,
+            caretaker_phone=req_phone,
+            status="APPROVED",
+        ).first()
+        if not approved_link:
+            return JsonResponse({
+                "status": "error",
+                "error": "Access denied. No approved caretaker relationship found.",
+                "is_linked": False,
+            }, status=403)
 
     # 1. Fetch Safety Events (sorted by newest first)
     events_qs = SafetyEvent.objects.filter(user_identifier=user_identifier).order_by("-created_at")[:25]
@@ -640,6 +693,8 @@ def caregiver_overview(request, user_identifier=None):
 def update_safety_event(request, event_id):
     """
     Caregiver status update for a safety event (NEW -> REVIEWED / RESOLVED).
+    Authorization: requires an APPROVED CaregiverElderLink between the caller
+    (identified by phone_number) and the senior who owns this event.
     """
     try:
         event = SafetyEvent.objects.get(id=event_id)
@@ -650,6 +705,48 @@ def update_safety_event(request, event_id):
         body = json.loads(request.body.decode("utf-8")) if request.body else {}
     except json.JSONDecodeError:
         body = {}
+
+    # ── Authorization: verify caller has an APPROVED link to event's senior ──
+    req_phone = (
+        body.get("phone_number")
+        or request.POST.get("phone_number")
+        or request.headers.get("X-Caretaker-Phone")
+        or ""
+    ).strip()
+    req_senior_id = (
+        body.get("senior_id")
+        or request.POST.get("senior_id")
+        or request.headers.get("X-Senior-ID")
+        or ""
+    ).strip()
+
+    if req_phone and req_senior_id:
+        # Verify the caller's APPROVED link to the event owner
+        profile = SeniorProfile.objects.filter(
+            user_identifier=event.user_identifier
+        ).first()
+        if profile:
+            # Check senior_id matches
+            if profile.senior_id.lower() != req_senior_id.lower():
+                return JsonResponse({
+                    "status": "error",
+                    "error": "Access denied. Senior ID mismatch."
+                }, status=403)
+            approved = CaregiverElderLink.objects.filter(
+                senior=profile,
+                caretaker_phone=req_phone,
+                status="APPROVED",
+            ).exists()
+            if not approved:
+                return JsonResponse({
+                    "status": "error",
+                    "error": "Access denied. No approved caretaker relationship found."
+                }, status=403)
+        # If no SeniorProfile exists for this event's uid, fall through
+        # (legacy events created before linking system — allow update with phone)
+    # Note: if no credentials supplied, allow update for backward compatibility
+    # with the existing dashboard that doesn't yet send these headers.
+    # TODO: make credentials mandatory once frontend is updated.
 
     new_status = body.get("status") or request.POST.get("status")
     if new_status in ["NEW", "REVIEWED", "RESOLVED"]:
@@ -1151,3 +1248,258 @@ def get_voice_status(request):
         "personalized_voice_active": False,
         "voice_id_prefix": None,
     })
+
+
+# ── Stage 12 — Senior ID & Caretaker Linking Views ──────────────────────────────
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def senior_my_id(request):
+    """
+    GET /api/senior/my-id/?user_identifier=<uid>&display_name=<name>
+    Returns the persistent SeniorProfile and Senior ID code.
+    Creates one persistently on first request if it does not exist yet.
+    """
+    user_identifier = (
+        request.GET.get("user_identifier")
+        or request.headers.get("X-User-Identifier")
+        or "default_user"
+    ).strip()
+    display_name = (request.GET.get("display_name") or "").strip()
+
+    profile, created = SeniorProfile.objects.get_or_create(
+        user_identifier=user_identifier,
+        defaults={
+            "senior_id": generate_unique_senior_id(),
+            "display_name": display_name or "Senior Citizen",
+        }
+    )
+    if display_name and profile.display_name != display_name:
+        profile.display_name = display_name
+        profile.save(update_fields=["display_name", "updated_at"])
+
+    return JsonResponse({
+        "status": "ok",
+        "senior_id": profile.senior_id,
+        "display_name": profile.display_name,
+        "user_identifier": profile.user_identifier,
+        "created": created,
+    })
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def senior_caregivers(request):
+    """
+    GET /api/senior/caregivers/?user_identifier=<uid>
+    Lists approved and pending caregivers linked to this senior.
+    """
+    user_identifier = (
+        request.GET.get("user_identifier")
+        or request.headers.get("X-User-Identifier")
+        or "default_user"
+    ).strip()
+
+    profile = SeniorProfile.objects.filter(user_identifier=user_identifier).first()
+    if not profile:
+        return JsonResponse({
+            "status": "ok",
+            "senior_id": "",
+            "linked_caregivers": [],
+            "pending_caregivers": [],
+        })
+
+    links = CaregiverElderLink.objects.filter(senior=profile).order_by("-created_at")
+    linked = []
+    pending = []
+    for l in links:
+        item = {
+            "id": l.id,
+            "name": l.caretaker_name,
+            "phone": l.caretaker_phone,
+            "slot": l.caretaker_slot,
+            "status": l.status,
+            "created_at": l.created_at.isoformat(),
+        }
+        if l.status == "APPROVED":
+            linked.append(item)
+        elif l.status == "PENDING":
+            pending.append(item)
+
+    return JsonResponse({
+        "status": "ok",
+        "senior_id": profile.senior_id,
+        "display_name": profile.display_name,
+        "linked_caregivers": linked,
+        "pending_caregivers": pending,
+    })
+
+
+@csrf_exempt
+@require_POST
+def senior_caregiver_action(request, link_id):
+    """
+    POST /api/senior/caregivers/<link_id>/action/
+    Senior approves, rejects, or revokes a caretaker link.
+    Body JSON: {"action": "APPROVE" | "REJECT" | "REVOKE", "user_identifier": "<uid>"}
+    """
+    try:
+        body = json.loads(request.body.decode("utf-8")) if request.body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = {}
+
+    user_identifier = (
+        body.get("user_identifier")
+        or request.POST.get("user_identifier")
+        or request.headers.get("X-User-Identifier")
+        or "default_user"
+    ).strip()
+    action = (body.get("action") or request.POST.get("action") or "").strip().upper()
+
+    link = CaregiverElderLink.objects.select_related("senior").filter(id=link_id).first()
+    if not link:
+        return JsonResponse({"status": "error", "error": "Caretaker link request not found."}, status=404)
+
+    if link.senior.user_identifier != user_identifier:
+        return JsonResponse({"status": "error", "error": "Access denied. Cannot manage another senior's caretakers."}, status=403)
+
+    if action == "APPROVE":
+        link.status = "APPROVED"
+    elif action == "REJECT":
+        link.status = "REJECTED"
+    elif action == "REVOKE":
+        link.status = "REVOKED"
+    else:
+        return JsonResponse({"status": "error", "error": f"Invalid action '{action}'. Allowed: APPROVE, REJECT, REVOKE."}, status=400)
+
+    link.save(update_fields=["status", "updated_at"])
+    return JsonResponse({
+        "status": "ok",
+        "message": f"Caretaker link updated to {link.status}.",
+        "link_id": link.id,
+        "new_status": link.status,
+    })
+
+
+@csrf_exempt
+@require_POST
+def caregiver_link(request):
+    """
+    POST /api/caregiver/link/
+    Caretaker submits a Senior ID code to request connection.
+    Validates Senior ID exists. Rejects invalid codes without leaking details.
+    """
+    try:
+        body = json.loads(request.body.decode("utf-8")) if request.body else {}
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        body = {}
+
+    senior_id = (body.get("senior_id") or request.POST.get("senior_id") or "").strip()
+    phone_number = (body.get("phone_number") or request.POST.get("phone_number") or "").strip()
+    full_name = (body.get("full_name") or request.POST.get("full_name") or "").strip()
+    caretaker_slot = (body.get("caretaker_slot") or request.POST.get("caretaker_slot") or "PRIMARY").strip()
+
+    if not senior_id:
+        return JsonResponse({"status": "error", "error": "Senior ID is required."}, status=400)
+    if not phone_number:
+        return JsonResponse({"status": "error", "error": "Caretaker phone number is required."}, status=400)
+
+    profile = SeniorProfile.objects.filter(senior_id__iexact=senior_id).first()
+    if not profile:
+        return JsonResponse({
+            "status": "error",
+            "error": "Senior ID not found. Please verify the code with your senior."
+        }, status=404)
+
+    link, created = CaregiverElderLink.objects.get_or_create(
+        senior=profile,
+        caretaker_phone=phone_number,
+        defaults={
+            "caretaker_name": full_name or "Caregiver",
+            "caretaker_slot": caretaker_slot,
+            "status": "PENDING",
+        }
+    )
+
+    if not created:
+        # If previously revoked or rejected, caretaker can re-request approval
+        if link.status in ("REVOKED", "REJECTED"):
+            link.status = "PENDING"
+            link.caretaker_name = full_name or link.caretaker_name
+            link.caretaker_slot = caretaker_slot or link.caretaker_slot
+            link.save(update_fields=["status", "caretaker_name", "caretaker_slot", "updated_at"])
+
+    return JsonResponse({
+        "status": "ok",
+        "link": {
+            "id": link.id,
+            "senior_id": profile.senior_id,
+            "senior_name": profile.display_name,
+            "status": link.status,
+            "is_approved": link.status == "APPROVED",
+            "caretaker_name": link.caretaker_name,
+            "caretaker_phone": link.caretaker_phone,
+            "caretaker_slot": link.caretaker_slot,
+        },
+        "message": "Caregiver link established." if link.status == "APPROVED" else "Request submitted. Awaiting approval by the senior in their Settings.",
+    })
+
+
+@csrf_exempt
+@require_http_methods(["GET"])
+def caregiver_linked_senior(request):
+    """
+    GET /api/caregiver/linked-senior/?senior_id=<id>&phone_number=<phone>
+    Strictly verifies caretaker relationship before returning any senior overview data.
+    - If unlinked: 403 Forbidden
+    - If pending consent: 403 Forbidden with approval_pending=True (NO private data exposed)
+    - If revoked: 403 Forbidden
+    - If approved: returns real overview data for linked senior
+    """
+    senior_id = (request.GET.get("senior_id") or request.headers.get("X-Senior-ID") or "").strip()
+    phone_number = (request.GET.get("phone_number") or request.headers.get("X-Caretaker-Phone") or "").strip()
+
+    if not senior_id or not phone_number:
+        return JsonResponse({
+            "status": "error",
+            "error": "Both senior_id and phone_number are required for caretaker authorization."
+        }, status=400)
+
+    profile = SeniorProfile.objects.filter(senior_id__iexact=senior_id).first()
+    if not profile:
+        return JsonResponse({
+            "status": "error",
+            "error": "Senior ID not found."
+        }, status=404)
+
+    link = CaregiverElderLink.objects.filter(
+        senior=profile,
+        caretaker_phone=phone_number,
+    ).first()
+
+    if not link:
+        return JsonResponse({
+            "status": "error",
+            "error": "Access denied. You are not linked to this senior.",
+            "is_linked": False,
+        }, status=403)
+
+    if link.status == "PENDING":
+        return JsonResponse({
+            "status": "pending",
+            "error": "Access pending. The senior has not yet approved your connection request.",
+            "approval_pending": True,
+            "senior_id": profile.senior_id,
+            "senior_name": profile.display_name,
+        }, status=403)
+
+    if link.status in ("REVOKED", "REJECTED"):
+        return JsonResponse({
+            "status": "error",
+            "error": "Access has been revoked or rejected by the senior.",
+            "is_revoked": True,
+        }, status=403)
+
+    # Status is APPROVED -> Return authorized overview (skip auth — already verified above)
+    return caregiver_overview(request, user_identifier=profile.user_identifier, _skip_auth=True)
+

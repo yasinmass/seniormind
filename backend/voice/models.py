@@ -189,3 +189,114 @@ class UserVoicePreference(models.Model):
     def __str__(self):
         return f"[{self.user_identifier}] provider={self.provider} voice_id={self.elevenlabs_voice_id}"
 
+
+def generate_unique_senior_id() -> str:
+    """
+    Generate a non-sequential, random Senior ID format: SM-XXXX-YYYY
+    Uses un-ambiguous alphanumeric characters (excluding 0, O, 1, I).
+    Guarantees uniqueness across SeniorProfile records.
+    """
+    import secrets
+    charset = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
+    while True:
+        part1 = "".join(secrets.choice(charset) for _ in range(4))
+        part2 = "".join(secrets.choice(charset) for _ in range(4))
+        candidate = f"SM-{part1}-{part2}"
+        if not SeniorProfile.objects.filter(senior_id=candidate).exists():
+            return candidate
+
+
+class SeniorProfile(models.Model):
+    """
+    Stores persistent Senior Profile and public Senior ID code (e.g. SM-7K4P-9Q2X).
+    Maps internal user_identifier to a non-sequential, random public Senior ID.
+    Never exposes internal primary keys or internal user_identifier to external caretakers.
+    """
+    user_identifier = models.CharField(
+        max_length=150,
+        unique=True,
+        db_index=True,
+        help_text="Internal user identifier for this senior (e.g. default_user or session uid)."
+    )
+    senior_id = models.CharField(
+        max_length=30,
+        unique=True,
+        db_index=True,
+        help_text="Public unique Senior ID (e.g. SM-7K4P-9Q2X)."
+    )
+    display_name = models.CharField(
+        max_length=150,
+        default="Senior Citizen",
+        help_text="Display name chosen by the senior."
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Senior Profile"
+        verbose_name_plural = "Senior Profiles"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"[{self.senior_id}] {self.display_name} ({self.user_identifier})"
+
+
+class CaregiverElderLink(models.Model):
+    """
+    Represents an authorized or pending relationship between a caretaker and a senior.
+    Multiple caretakers can link to the same senior.
+    Status transitions: PENDING -> APPROVED | REJECTED | REVOKED.
+    """
+    STATUS_CHOICES = (
+        ("PENDING", "Pending Approval"),
+        ("APPROVED", "Approved"),
+        ("REJECTED", "Rejected"),
+        ("REVOKED", "Revoked"),
+    )
+
+    senior = models.ForeignKey(
+        SeniorProfile,
+        on_delete=models.CASCADE,
+        related_name="caregiver_links",
+        help_text="The linked senior."
+    )
+    caretaker_phone = models.CharField(
+        max_length=30,
+        db_index=True,
+        help_text="Caretaker phone number or contact identifier."
+    )
+    caretaker_name = models.CharField(
+        max_length=150,
+        default="Caregiver",
+        help_text="Caretaker name."
+    )
+    caretaker_slot = models.CharField(
+        max_length=20,
+        default="PRIMARY",
+        help_text="Caretaker role slot ('PRIMARY' or 'SECONDARY')."
+    )
+    status = models.CharField(
+        max_length=20,
+        choices=STATUS_CHOICES,
+        default="PENDING",
+        db_index=True,
+        help_text="Approval status of this link."
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Caregiver Elder Link"
+        verbose_name_plural = "Caregiver Elder Links"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["senior", "caretaker_phone"],
+                name="unique_senior_caretaker_phone"
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.caretaker_name} ({self.caretaker_phone}) -> {self.senior.senior_id} [{self.status}]"
+
+

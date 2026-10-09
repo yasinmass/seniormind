@@ -112,7 +112,9 @@ def test_full_api_multiturn():
     
     # Generate test WAV for input
     wav1 = generate_speech("My daughter's name is Priya.", "en")
+    wav1 = wav1[0] if isinstance(wav1, tuple) else wav1
     wav2 = generate_speech("What is her name?", "en")
+    wav2 = wav2[0] if isinstance(wav2, tuple) else wav2
 
     session_id = f"test-api-session-{generate_session_id()}"
 
